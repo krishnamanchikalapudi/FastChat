@@ -2,19 +2,22 @@
 DATE_TIME=`date '+%Y-%m-%d %H:%M:%S'`
 
 #linus
-# pids=`lsof -i -P -n | grep python3 | awk '{print $2}'`
+#pids=`lsof -i -P -n | grep -E fastchat\|python3\|8080 | awk '{print $2}'`
 
 # mac
-pids=`ps uax | grep fastchat | awk '{print $2}'`
+#pids=`ps uax | grep fastchat | awk '{print $2}'`
+pids=`ps uax | grep -E fastchat\|python3\|8080 | awk '{print $2}'`
 serviceIds=(${pids})
 idsCount=(${#serviceIds[@]} - 1)
 
-printf "\n -------------------- [BEGIN at {`date '+%Y-%m-%d %H:%M:%S'`}] -------------------- \n "
-printf "    # # ### #   #               ###  #   ## ###  ## # #  #  ###  \n "
-printf "    # #  #  #   #               #   # # #    #  #   # # # #  #   \n "
-printf "    ##   #  #   #       ###     ##  ###  #   #  #   ### ###  #   \n "
-printf "    # #  #  #   #               #   # #   #  #  #   # # # #  #   \n "
-printf "    # # ### ### ###             #   # # ##   #   ## # # # #  #   \n "
+printf "\n ---------------------- [BEGIN at {`date '+%Y-%m-%d %H:%M:%S'`}] ---------------------- \n "
+printf " ------------------------------------------------------------------------------ \n "
+printf "         # # ### #   #               ###  #   ## ###  ## # #  #  ###  \n "
+printf "         # #  #  #   #               #   # # #    #  #   # # # #  #   \n "
+printf "         ##   #  #   #       ###     ##  ###  #   #  #   ### ###  #   \n "
+printf "         # #  #  #   #               #   # #   #  #  #   # # # #  #   \n "
+printf "         # # ### ### ###             #   # # ##   #   ## # # # #  #   \n "
+printf " ------------------------------------------------------------------------------ \n "
 
 printf "\nPIDs: ${serviceIds}\n"
 printf "\nPIDs count: ${idsCount}\n"
