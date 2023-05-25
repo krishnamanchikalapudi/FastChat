@@ -22,7 +22,18 @@ FastChat is an open platform for training, serving, and evaluating large languag
 - [Fine-tuning](#fine-tuning)
 
 ## Install
+### LOCAL start
+```bash
+./start.sh pre
+./start.sh init
+./start.sh web
+```
+### LOCAL stop
+```bash
+./stop.sh
+```
 
+------- BELOW STUFF NOT REQUIRE to setup on local machine ------- 
 ### Method 1: With pip
 
 ```bash
