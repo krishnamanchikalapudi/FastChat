@@ -8,6 +8,7 @@ import dataclasses
 from enum import Enum, auto
 import json
 import logging
+import os
 import time
 from typing import List, Union
 import threading
@@ -18,8 +19,12 @@ import numpy as np
 import requests
 import uvicorn
 
-from fastchat.constants import (CONTROLLER_HEART_BEAT_EXPIRATION, ErrorCode,
-    SERVER_ERROR_MSG)
+from fastchat.constants import (
+    CONTROLLER_HEART_BEAT_EXPIRATION,
+    WORKER_API_TIMEOUT,
+    ErrorCode,
+    SERVER_ERROR_MSG,
+)
 from fastchat.utils import build_logger
 
 
@@ -47,12 +52,13 @@ class WorkerInfo:
     queue_length: int
     check_heart_beat: bool
     last_heart_beat: str
+    multimodal: bool
 
 
 def heart_beat_controller(controller):
     while True:
         time.sleep(CONTROLLER_HEART_BEAT_EXPIRATION)
-        controller.remove_stable_workers_by_expiration()
+        controller.remove_stale_workers_by_expiration()
 
 
 class Controller:
@@ -66,10 +72,12 @@ class Controller:
         )
         self.heart_beat_thread.start()
 
-        logger.info("Init controller")
-
     def register_worker(
-        self, worker_name: str, check_heart_beat: bool, worker_status: dict
+        self,
+        worker_name: str,
+        check_heart_beat: bool,
+        worker_status: dict,
+        multimodal: bool,
     ):
         if worker_name not in self.worker_info:
             logger.info(f"Register a new worker: {worker_name}")
@@ -87,6 +95,7 @@ class Controller:
             worker_status["queue_length"],
             check_heart_beat,
             time.time(),
+            multimodal,
         )
 
         logger.info(f"Register done: {worker_name}, {worker_status}")
@@ -113,7 +122,9 @@ class Controller:
         self.worker_info = {}
 
         for w_name, w_info in old_info.items():
-            if not self.register_worker(w_name, w_info.check_heart_beat, None):
+            if not self.register_worker(
+                w_name, w_info.check_heart_beat, None, w_info.multimodal
+            ):
                 logger.info(f"Remove stale worker: {w_name}")
 
     def list_models(self):
@@ -121,6 +132,24 @@ class Controller:
 
         for w_name, w_info in self.worker_info.items():
             model_names.update(w_info.model_names)
+
+        return list(model_names)
+
+    def list_multimodal_models(self):
+        model_names = set()
+
+        for w_name, w_info in self.worker_info.items():
+            if w_info.multimodal:
+                model_names.update(w_info.model_names)
+
+        return list(model_names)
+
+    def list_language_models(self):
+        model_names = set()
+
+        for w_name, w_info in self.worker_info.items():
+            if not w_info.multimodal:
+                model_names.update(w_info.model_names)
 
         return list(model_names)
 
@@ -187,7 +216,7 @@ class Controller:
         logger.info(f"Receive heart beat. {worker_name}")
         return True
 
-    def remove_stable_workers_by_expiration(self):
+    def remove_stale_workers_by_expiration(self):
         expire = time.time() - CONTROLLER_HEART_BEAT_EXPIRATION
         to_delete = []
         for worker_name, w_info in self.worker_info.items():
@@ -197,7 +226,7 @@ class Controller:
         for worker_name in to_delete:
             self.remove_worker(worker_name)
 
-    def handle_no_worker(params):
+    def handle_no_worker(self, params):
         logger.info(f"no worker: {params['model']}")
         ret = {
             "text": SERVER_ERROR_MSG,
@@ -205,61 +234,13 @@ class Controller:
         }
         return json.dumps(ret).encode() + b"\0"
 
-    def handle_worker_timeout(worker_address):
+    def handle_worker_timeout(self, worker_address):
         logger.info(f"worker timeout: {worker_address}")
         ret = {
             "text": SERVER_ERROR_MSG,
             "error_code": ErrorCode.CONTROLLER_WORKER_TIMEOUT,
         }
         return json.dumps(ret).encode() + b"\0"
-
-    def worker_api_generate_stream(self, params):
-        worker_addr = self.get_worker_address(params["model"])
-        if not worker_addr:
-            yield self.handle_no_worker(params)
-
-        try:
-            response = requests.post(
-                worker_addr + "/worker_generate_stream",
-                json=params,
-                stream=True,
-                timeout=15,
-            )
-            for chunk in response.iter_lines(decode_unicode=False, delimiter=b"\0"):
-                if chunk:
-                    yield chunk + b"\0"
-        except requests.exceptions.RequestException as e:
-            yield self.handle_worker_timeout(worker_addr)
-
-    def worker_api_generate_completion(self, params):
-        worker_addr = self.get_worker_address(params["model"])
-        if not worker_addr:
-            return self.handle_no_worker(params)
-
-        try:
-            response = requests.post(
-                worker_addr + "/worker_generate_completion",
-                json=params,
-                timeout=15,
-            )
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            return self.handle_worker_timeout(worker_addr)
-
-    def worker_api_embeddings(self, params):
-        worker_addr = self.get_worker_address(params["model"])
-        if not worker_addr:
-            return self.handle_no_worker(params)
-
-        try:
-            response = requests.post(
-                worker_addr + "/worker_get_embeddings",
-                json=params,
-                timeout=15,
-            )
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            return self.handle_worker_timeout(worker_addr)
 
     # Let the controller act as a worker to achieve hierarchical
     # management. This can be used to connect isolated sub networks.
@@ -275,11 +256,30 @@ class Controller:
                 speed += worker_status["speed"]
                 queue_length += worker_status["queue_length"]
 
+        model_names = sorted(list(model_names))
         return {
-            "model_names": list(model_names),
+            "model_names": model_names,
             "speed": speed,
             "queue_length": queue_length,
         }
+
+    def worker_api_generate_stream(self, params):
+        worker_addr = self.get_worker_address(params["model"])
+        if not worker_addr:
+            yield self.handle_no_worker(params)
+
+        try:
+            response = requests.post(
+                worker_addr + "/worker_generate_stream",
+                json=params,
+                stream=True,
+                timeout=WORKER_API_TIMEOUT,
+            )
+            for chunk in response.iter_lines(decode_unicode=False, delimiter=b"\0"):
+                if chunk:
+                    yield chunk + b"\0"
+        except requests.exceptions.RequestException as e:
+            yield self.handle_worker_timeout(worker_addr)
 
 
 app = FastAPI()
@@ -289,7 +289,10 @@ app = FastAPI()
 async def register_worker(request: Request):
     data = await request.json()
     controller.register_worker(
-        data["worker_name"], data["check_heart_beat"], data.get("worker_status", None)
+        data["worker_name"],
+        data["check_heart_beat"],
+        data.get("worker_status", None),
+        data.get("multimodal", False),
     )
 
 
@@ -301,6 +304,18 @@ async def refresh_all_workers():
 @app.post("/list_models")
 async def list_models():
     models = controller.list_models()
+    return {"models": models}
+
+
+@app.post("/list_multimodal_models")
+async def list_multimodal_models():
+    models = controller.list_multimodal_models()
+    return {"models": models}
+
+
+@app.post("/list_language_models")
+async def list_language_models():
+    models = controller.list_language_models()
     return {"models": models}
 
 
@@ -325,26 +340,17 @@ async def worker_api_generate_stream(request: Request):
     return StreamingResponse(generator)
 
 
-@app.post("/worker_generate_completion")
-async def worker_api_generate_completion(request: Request):
-    params = await request.json()
-    output = controller.worker_api_generate_completion(params)
-    return output
-
-
-@app.post("/worker_get_embeddings")
-async def worker_api_embeddings(request: Request):
-    params = await request.json()
-    output = controller.worker_api_embeddings(params)
-    return output
-
-
 @app.post("/worker_get_status")
 async def worker_api_get_status(request: Request):
     return controller.worker_api_get_status()
 
 
-if __name__ == "__main__":
+@app.get("/test_connection")
+async def worker_api_get_status(request: Request):
+    return "success"
+
+
+def create_controller():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=21001)
@@ -354,8 +360,30 @@ if __name__ == "__main__":
         choices=["lottery", "shortest_queue"],
         default="shortest_queue",
     )
+    parser.add_argument(
+        "--ssl",
+        action="store_true",
+        required=False,
+        default=False,
+        help="Enable SSL. Requires OS Environment variables 'SSL_KEYFILE' and 'SSL_CERTFILE'.",
+    )
     args = parser.parse_args()
     logger.info(f"args: {args}")
 
     controller = Controller(args.dispatch_method)
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    return args, controller
+
+
+if __name__ == "__main__":
+    args, controller = create_controller()
+    if args.ssl:
+        uvicorn.run(
+            app,
+            host=args.host,
+            port=args.port,
+            log_level="info",
+            ssl_keyfile=os.environ["SSL_KEYFILE"],
+            ssl_certfile=os.environ["SSL_CERTFILE"],
+        )
+    else:
+        uvicorn.run(app, host=args.host, port=args.port, log_level="info")

@@ -1,20 +1,26 @@
+"""
+Common utilities.
+"""
 from asyncio import AbstractEventLoop
+from io import BytesIO
+import base64
 import json
 import logging
 import logging.handlers
 import os
 import platform
 import sys
+import time
 from typing import AsyncGenerator, Generator
 import warnings
 
 import requests
-import torch
 
 from fastchat.constants import LOGDIR
 
 
 handler = None
+visited_loggers = set()
 
 
 def build_logger(logger_name, logger_filename):
@@ -54,8 +60,11 @@ def build_logger(logger_name, logger_filename):
     logger = logging.getLogger(logger_name)
     logger.setLevel(logging.INFO)
 
-    # Add a file handler for all loggers
-    if handler is None:
+    # Avoid httpx flooding POST logs
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+    # if LOGDIR is empty, then don't try output log to local file
+    if LOGDIR != "":
         os.makedirs(LOGDIR, exist_ok=True)
         filename = os.path.join(LOGDIR, logger_filename)
         handler = logging.handlers.TimedRotatingFileHandler(
@@ -63,9 +72,11 @@ def build_logger(logger_name, logger_filename):
         )
         handler.setFormatter(formatter)
 
-        for name, item in logging.root.manager.loggerDict.items():
-            if isinstance(item, logging.Logger):
-                item.addHandler(handler)
+        for l in [stdout_logger, stderr_logger, logger]:
+            if l in visited_loggers:
+                continue
+            visited_loggers.add(l)
+            l.addHandler(handler)
 
     return logger
 
@@ -118,6 +129,8 @@ def disable_torch_init():
 
 def get_gpu_memory(max_gpus=None):
     """Get available memory for each GPU."""
+    import torch
+
     gpu_memory = []
     num_gpus = (
         torch.cuda.device_count()
@@ -136,32 +149,69 @@ def get_gpu_memory(max_gpus=None):
     return gpu_memory
 
 
-def violates_moderation(text):
+def oai_moderation(text, custom_thresholds=None):
     """
     Check whether the text violates OpenAI moderation API.
     """
-    url = "https://api.openai.com/v1/moderations"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer " + os.environ["OPENAI_API_KEY"],
-    }
-    text = text.replace("\n", "")
-    data = "{" + '"input": ' + f'"{text}"' + "}"
-    data = data.encode("utf-8")
-    try:
-        ret = requests.post(url, headers=headers, data=data, timeout=5)
-        flagged = ret.json()["results"][0]["flagged"]
-    except requests.exceptions.RequestException as e:
-        flagged = False
-    except KeyError as e:
-        flagged = False
+    import openai
 
+    client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+    # default to true to be conservative
+    flagged = True
+    MAX_RETRY = 3
+    for _ in range(MAX_RETRY):
+        try:
+            res = client.moderations.create(input=text)
+            flagged = res.results[0].flagged
+            if custom_thresholds is not None:
+                for category, threshold in custom_thresholds.items():
+                    if getattr(res.results[0].category_scores, category) > threshold:
+                        flagged = True
+            break
+        except (openai.OpenAIError, KeyError, IndexError) as e:
+            print(f"MODERATION ERROR: {e}\nInput: {text}")
     return flagged
 
 
-# Flan-t5 trained with HF+FSDP saves corrupted  weights for shared embeddings,
-# Use this function to make sure it can be correctly loaded.
+def moderation_filter(text, model_list, do_moderation=False):
+    # Apply moderation for below models
+    MODEL_KEYWORDS = [
+        "claude",
+        "gpt",
+        "bard",
+        "mistral-large",
+        "command-r",
+        "dbrx",
+        "gemini",
+        "reka",
+        "eureka",
+    ]
+
+    custom_thresholds = {"sexual": 0.3}
+    # set a stricter threshold for claude
+    for model in model_list:
+        if "claude" in model:
+            custom_thresholds = {"sexual": 0.2}
+
+    for keyword in MODEL_KEYWORDS:
+        for model in model_list:
+            if keyword in model:
+                do_moderation = True
+                break
+
+    if do_moderation:
+        return oai_moderation(text, custom_thresholds)
+    return False
+
+
 def clean_flant5_ckpt(ckpt_path):
+    """
+    Flan-t5 trained with HF+FSDP saves corrupted  weights for shared embeddings,
+    Use this function to make sure it can be correctly loaded.
+    """
+    import torch
+
     index_file = os.path.join(ckpt_path, "pytorch_model.bin.index.json")
     index_json = json.load(open(index_file, "r"))
 
@@ -194,6 +244,32 @@ function() {
     console.log("url_params", url_params);
     return url_params;
     }
+"""
+
+get_window_url_params_with_tos_js = """
+function() {
+    const params = new URLSearchParams(window.location.search);
+    const url_params = Object.fromEntries(params);
+    console.log("url_params", url_params);
+
+    const urlContainsLeaderboard = Object.keys(url_params).some(key => key.toLowerCase().includes("leaderboard"));
+    const msg = "Users of this website are required to agree to the following terms:\\n\\nThe service is a research preview. It only provides limited safety measures and may generate offensive content. It must not be used for any illegal, harmful, violent, racist, or sexual purposes.\\nPlease do not upload any private information.\\nThe service collects user dialogue data, including both text and images, and reserves the right to distribute it under a Creative Commons Attribution (CC-BY) or a similar license.";
+    if (!urlContainsLeaderboard) {
+        if (window.alerted_before) return;
+        alert(msg);
+        window.alerted_before = true;
+    }
+    return url_params;
+    }
+"""
+
+alert_js = """
+() => {
+    if (window.alerted_before) return;
+    const msg = "Users of this website are required to agree to the following terms:\\n\\nThe service is a research preview. It only provides limited safety measures and may generate offensive content. It must not be used for any illegal, harmful, violent, racist, or sexual purposes.\\nPlease do not upload any private information.\\nThe service collects user dialogue data, including both text and images, and reserves the right to distribute it under a Creative Commons Attribution (CC-BY) or a similar license.";
+    alert(msg);
+    window.alerted_before = true;
+}
 """
 
 
@@ -237,3 +313,173 @@ def detect_language(text: str) -> str:
     except (pycld2.error, polyglot.detect.base.UnknownLanguage):
         lang_code = "unknown"
     return lang_code
+
+
+def parse_gradio_auth_creds(filename: str):
+    """Parse a username:password file for gradio authorization."""
+    gradio_auth_creds = []
+    with open(filename, "r", encoding="utf8") as file:
+        for line in file.readlines():
+            gradio_auth_creds += [x.strip() for x in line.split(",") if x.strip()]
+    if gradio_auth_creds:
+        auth = [tuple(cred.split(":")) for cred in gradio_auth_creds]
+    else:
+        auth = None
+    return auth
+
+
+def is_partial_stop(output: str, stop_str: str):
+    """Check whether the output contains a partial stop str."""
+    for i in range(0, min(len(output), len(stop_str))):
+        if stop_str.startswith(output[-i:]):
+            return True
+    return False
+
+
+def run_cmd(cmd: str):
+    """Run a bash command."""
+    print(cmd)
+    return os.system(cmd)
+
+
+def is_sentence_complete(output: str):
+    """Check whether the output is a complete sentence."""
+    end_symbols = (".", "?", "!", "...", "。", "？", "！", "…", '"', "'", "”")
+    return output.endswith(end_symbols)
+
+
+# Models don't use the same configuration key for determining the maximum
+# sequence length.  Store them here so we can sanely check them.
+# NOTE: The ordering here is important.  Some models have two of these and we
+# have a preference for which value gets used.
+SEQUENCE_LENGTH_KEYS = [
+    "max_position_embeddings",
+    "max_sequence_length",
+    "seq_length",
+    "max_seq_len",
+    "model_max_length",
+]
+
+
+def get_context_length(config):
+    """Get the context length of a model from a huggingface model config."""
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if rope_scaling:
+        rope_scaling_factor = config.rope_scaling["factor"]
+    else:
+        rope_scaling_factor = 1
+
+    for key in SEQUENCE_LENGTH_KEYS:
+        val = getattr(config, key, None)
+        if val is not None:
+            return int(rope_scaling_factor * val)
+    return 2048
+
+
+def str_to_torch_dtype(dtype: str):
+    import torch
+
+    if dtype is None:
+        return None
+    elif dtype == "float32":
+        return torch.float32
+    elif dtype == "float16":
+        return torch.float16
+    elif dtype == "bfloat16":
+        return torch.bfloat16
+    else:
+        raise ValueError(f"Unrecognized dtype: {dtype}")
+
+
+def load_image(image_file):
+    from PIL import Image
+    import requests
+
+    image = None
+
+    if image_file.startswith("http://") or image_file.startswith("https://"):
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+        response = requests.get(image_file, timeout=timeout)
+        image = Image.open(BytesIO(response.content))
+    elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
+        image = Image.open(image_file)
+    elif image_file.startswith("data:"):
+        image_file = image_file.split(",")[1]
+        image = Image.open(BytesIO(base64.b64decode(image_file)))
+    else:
+        image = Image.open(BytesIO(base64.b64decode(image_file)))
+
+    return image
+
+
+def upload_image_file_to_gcs(image, filename):
+    from google.cloud import storage
+    import io
+
+    storage_client = storage.Client()
+    # upload file to GCS
+    bucket = storage_client.get_bucket("arena_service_data")
+
+    blob = bucket.blob(f"{filename}")
+    if not blob.exists():
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        buffer.seek(0)
+        blob.upload_from_file(buffer, content_type="image/png")
+
+    return blob.public_url
+
+
+def get_image_file_from_gcs(filename):
+    from google.cloud import storage
+
+    storage_client = storage.Client()
+    bucket = storage_client.get_bucket("arena_service_data")
+    blob = bucket.blob(f"{filename}")
+    contents = blob.download_as_bytes()
+
+    return contents
+
+
+def image_moderation_request(image_bytes, endpoint, api_key):
+    headers = {"Content-Type": "image/jpeg", "Ocp-Apim-Subscription-Key": api_key}
+
+    MAX_RETRIES = 3
+    for _ in range(MAX_RETRIES):
+        response = requests.post(endpoint, headers=headers, data=image_bytes).json()
+        try:
+            if response["Status"]["Code"] == 3000:
+                break
+        except:
+            time.sleep(0.5)
+    return response
+
+
+def image_moderation_provider(image, api_type):
+    if api_type == "nsfw":
+        endpoint = os.environ["AZURE_IMG_MODERATION_ENDPOINT"]
+        api_key = os.environ["AZURE_IMG_MODERATION_API_KEY"]
+        response = image_moderation_request(image, endpoint, api_key)
+        print(response)
+        return response["IsImageAdultClassified"]
+    elif api_type == "csam":
+        endpoint = (
+            "https://api.microsoftmoderator.com/photodna/v1.0/Match?enhance=false"
+        )
+        api_key = os.environ["PHOTODNA_API_KEY"]
+        response = image_moderation_request(image, endpoint, api_key)
+        return response["IsMatch"]
+
+
+def image_moderation_filter(image):
+    print(f"moderating image")
+
+    image_bytes = base64.b64decode(image.base64_str)
+
+    nsfw_flagged = image_moderation_provider(image_bytes, "nsfw")
+    csam_flagged = False
+
+    if nsfw_flagged:
+        csam_flagged = image_moderation_provider(image_bytes, "csam")
+
+    return nsfw_flagged, csam_flagged

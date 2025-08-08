@@ -48,11 +48,23 @@ class UsageInfo(BaseModel):
     completion_tokens: Optional[int] = 0
 
 
+class LogProbs(BaseModel):
+    text_offset: List[int] = Field(default_factory=list)
+    token_logprobs: List[Optional[float]] = Field(default_factory=list)
+    tokens: List[str] = Field(default_factory=list)
+    top_logprobs: List[Optional[Dict[str, float]]] = Field(default_factory=list)
+
+
 class ChatCompletionRequest(BaseModel):
     model: str
-    messages: Union[str, List[Dict[str, str]]]
+    messages: Union[
+        str,
+        List[Dict[str, str]],
+        List[Dict[str, Union[str, List[Dict[str, Union[str, Dict[str, str]]]]]]],
+    ]
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 1.0
+    top_k: Optional[int] = -1
     n: Optional[int] = 1
     max_tokens: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
@@ -70,7 +82,7 @@ class ChatMessage(BaseModel):
 class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
-    finish_reason: Optional[Literal["stop", "length"]]
+    finish_reason: Optional[Literal["stop", "length"]] = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -90,7 +102,7 @@ class DeltaMessage(BaseModel):
 class ChatCompletionResponseStreamChoice(BaseModel):
     index: int
     delta: DeltaMessage
-    finish_reason: Optional[Literal["stop", "length"]]
+    finish_reason: Optional[Literal["stop", "length"]] = None
 
 
 class ChatCompletionStreamResponse(BaseModel):
@@ -100,21 +112,33 @@ class ChatCompletionStreamResponse(BaseModel):
     model: str
     choices: List[ChatCompletionResponseStreamChoice]
 
-class TokenCheckRequest(BaseModel):
+
+class TokenCheckRequestItem(BaseModel):
     model: str
     prompt: str
     max_tokens: int
 
-class TokenCheckResponse(BaseModel):
+
+class TokenCheckRequest(BaseModel):
+    prompts: List[TokenCheckRequestItem]
+
+
+class TokenCheckResponseItem(BaseModel):
     fits: bool
     tokenCount: int
     contextLength: int
+
+
+class TokenCheckResponse(BaseModel):
+    prompts: List[TokenCheckResponseItem]
+
 
 class EmbeddingsRequest(BaseModel):
     model: Optional[str] = None
     engine: Optional[str] = None
     input: Union[str, List[Any]]
     user: Optional[str] = None
+    encoding_format: Optional[str] = None
 
 
 class EmbeddingsResponse(BaseModel):
@@ -134,18 +158,21 @@ class CompletionRequest(BaseModel):
     stop: Optional[Union[str, List[str]]] = None
     stream: Optional[bool] = False
     top_p: Optional[float] = 1.0
+    top_k: Optional[int] = -1
     logprobs: Optional[int] = None
     echo: Optional[bool] = False
     presence_penalty: Optional[float] = 0.0
     frequency_penalty: Optional[float] = 0.0
     user: Optional[str] = None
+    use_beam_search: Optional[bool] = False
+    best_of: Optional[int] = None
 
 
 class CompletionResponseChoice(BaseModel):
     index: int
     text: str
-    logprobs: Optional[int] = None
-    finish_reason: Optional[Literal["stop", "length"]]
+    logprobs: Optional[LogProbs] = None
+    finish_reason: Optional[Literal["stop", "length"]] = None
 
 
 class CompletionResponse(BaseModel):
@@ -160,7 +187,7 @@ class CompletionResponse(BaseModel):
 class CompletionResponseStreamChoice(BaseModel):
     index: int
     text: str
-    logprobs: Optional[float] = None
+    logprobs: Optional[LogProbs] = None
     finish_reason: Optional[Literal["stop", "length"]] = None
 
 
